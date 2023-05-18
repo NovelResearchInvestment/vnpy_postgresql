@@ -5,12 +5,14 @@ from peewee import (
     AutoField,
     CharField,
     DateTimeField,
-    FloatField, IntegerField,
+    FloatField,
+    IntegerField,
     Model,
     PostgresqlDatabase as PeeweePostgresqlDatabase,
     ModelSelect,
     ModelDelete,
-    fn
+    fn,
+    chunked,
 )
 
 from vnpy.trader.constant import Exchange, Interval
@@ -18,13 +20,14 @@ from vnpy.trader.object import BarData, TickData
 from vnpy.trader.database import (
     BaseDatabase,
     BarOverview,
+    TickOverview,
     DB_TZ,
     convert_tz
 )
 from vnpy.trader.setting import SETTINGS
 
 
-db = PeeweePostgresqlDatabase(
+db: PeeweePostgresqlDatabase = PeeweePostgresqlDatabase(
     database=SETTINGS["database.database"],
     user=SETTINGS["database.user"],
     password=SETTINGS["database.password"],
@@ -37,7 +40,7 @@ db = PeeweePostgresqlDatabase(
 class DbBarData(Model):
     """K线数据表映射对象"""
 
-    id = AutoField()
+    id: AutoField = AutoField()
 
     symbol: str = CharField()
     exchange: str = CharField()
@@ -53,14 +56,14 @@ class DbBarData(Model):
     close_price: float = FloatField()
 
     class Meta:
-        database = db
-        indexes = ((("symbol", "exchange", "interval", "datetime"), True),)
+        database: PeeweePostgresqlDatabase = db
+        indexes: tuple = ((("symbol", "exchange", "interval", "datetime"), True),)
 
 
 class DbTickData(Model):
     """TICK数据表映射对象"""
 
-    id = AutoField()
+    id: AutoField = AutoField()
 
     symbol: str = CharField()
     exchange: str = CharField()
@@ -107,14 +110,14 @@ class DbTickData(Model):
     localtime: datetime = DateTimeField(null=True)
 
     class Meta:
-        database = db
-        indexes = ((("symbol", "exchange", "datetime"), True),)
+        database: PeeweePostgresqlDatabase = db
+        indexes: tuple = ((("symbol", "exchange", "datetime"), True),)
 
 
 class DbBarOverview(Model):
     """K线汇总数据表映射对象"""
 
-    id = AutoField()
+    id: AutoField = AutoField()
 
     symbol: str = CharField()
     exchange: str = CharField()
@@ -124,8 +127,24 @@ class DbBarOverview(Model):
     end: datetime = DateTimeField()
 
     class Meta:
-        database = db
-        indexes = ((("symbol", "exchange", "interval"), True),)
+        database: PeeweePostgresqlDatabase = db
+        indexes: tuple = ((("symbol", "exchange", "interval"), True),)
+
+
+class DbTickOverview(Model):
+    """Tick汇总数据表映射对象"""
+
+    id: AutoField = AutoField()
+
+    symbol: str = CharField()
+    exchange: str = CharField()
+    count: int = IntegerField()
+    start: datetime = DateTimeField()
+    end: datetime = DateTimeField()
+
+    class Meta:
+        database: PeeweePostgresqlDatabase = db
+        indexes: tuple = ((("symbol", "exchange"), True),)
 
 
 class PostgresqlDatabase(BaseDatabase):
@@ -133,36 +152,44 @@ class PostgresqlDatabase(BaseDatabase):
 
     def __init__(self) -> None:
         """"""
-        self.db = db
+        self.db: PeeweePostgresqlDatabase = db
         self.db.connect()
-        self.db.create_tables([DbBarData, DbTickData, DbBarOverview])
+        self.db.create_tables([DbBarData, DbTickData, DbBarOverview, DbTickOverview])
 
-    def save_bar_data(self, bars: List[BarData]) -> bool:
+    def save_bar_data(self, bars: List[BarData], stream: bool = False) -> bool:
         """保存K线数据"""
         # 读取主键参数
-        bar = bars[0]
-        symbol = bar.symbol
-        exchange = bar.exchange
-        interval = bar.interval
+        bar: BarData = bars[0]
+        symbol: str = bar.symbol
+        exchange: Exchange = bar.exchange
+        interval: Interval = bar.interval
 
         # 将BarData数据转换为字典，并调整时区
-        data = []
+        data: list = []
 
         for bar in bars:
             bar.datetime = convert_tz(bar.datetime)
 
-            d = bar.__dict__
+            d: dict = bar.__dict__
             d["exchange"] = d["exchange"].value
             d["interval"] = d["interval"].value
             d.pop("gateway_name")
             d.pop("vt_symbol")
             data.append(d)
 
-        # 使用upsert操作将数据更新到数据库中
+        # 使用upsert操作将数据更新到数据库中 chunked批量操作加快速度
         with self.db.atomic():
-            for d in data:
-                DbBarData.insert(d).on_conflict(
-                    update=d,
+            for c in chunked(data, 100):
+                DbBarData.insert_many(c).on_conflict(
+                    update={
+                        DbBarData.volume: DbBarData.volume,
+                        DbBarData.turnover: DbBarData.turnover,
+                        DbBarData.open_interest: DbBarData.open_interest,
+                        DbBarData.open_price: DbBarData.open_price,
+                        DbBarData.high_price: DbBarData.high_price,
+                        DbBarData.low_price: DbBarData.low_price,
+                        DbBarData.close_price: DbBarData.close_price
+                    },
                     conflict_target=(
                         DbBarData.symbol,
                         DbBarData.exchange,
@@ -186,6 +213,9 @@ class PostgresqlDatabase(BaseDatabase):
             overview.start = bars[0].datetime
             overview.end = bars[-1].datetime
             overview.count = len(bars)
+        elif stream:
+            overview.end = bars[-1].datetime
+            overview.count += len(bars)
         else:
             overview.start = min(bars[0].datetime, overview.start)
             overview.end = max(bars[-1].datetime, overview.end)
@@ -201,15 +231,20 @@ class PostgresqlDatabase(BaseDatabase):
 
         return True
 
-    def save_tick_data(self, ticks: List[TickData]) -> bool:
+    def save_tick_data(self, ticks: List[TickData], stream: bool = False) -> bool:
         """保存TICK数据"""
+        # 读取主键参数
+        tick: TickData = ticks[0]
+        symbol: str = tick.symbol
+        exchange: Exchange = tick.exchange
+
         # 将TickData数据转换为字典，并调整时区
-        data = []
+        data: list = []
 
         for tick in ticks:
             tick.datetime = convert_tz(tick.datetime)
 
-            d = tick.__dict__
+            d: dict = tick.__dict__
             d["exchange"] = d["exchange"].value
             d.pop("gateway_name")
             d.pop("vt_symbol")
@@ -224,8 +259,82 @@ class PostgresqlDatabase(BaseDatabase):
                         DbTickData.symbol,
                         DbTickData.exchange,
                         DbTickData.datetime,
+
+
                     ),
                 ).execute()
+
+            for c in chunked(data, 100):
+                DbTickData.insert_many(c).on_conflict(
+                    update={
+                        DbTickData.name: DbTickData.name,
+                        DbTickData.volume: DbTickData.volume,
+                        DbTickData.turnover: DbTickData.turnover,
+                        DbTickData.open_interest: DbTickData.open_interest,
+                        DbTickData.last_price: DbTickData.last_price,
+                        DbTickData.last_volume: DbTickData.last_volume,
+                        DbTickData.limit_up: DbTickData.limit_up,
+                        DbTickData.limit_down: DbTickData.limit_down,
+                        DbTickData.open_price: DbTickData.open_price,
+                        DbTickData.high_price: DbTickData.high_price,
+                        DbTickData.low_price: DbTickData.low_price,
+                        DbTickData.pre_close: DbTickData.pre_close,
+                        DbTickData.bid_price_1: DbTickData.bid_price_1,
+                        DbTickData.bid_price_2: DbTickData.bid_price_2,
+                        DbTickData.bid_price_3: DbTickData.bid_price_3,
+                        DbTickData.bid_price_4: DbTickData.bid_price_4,
+                        DbTickData.bid_price_5: DbTickData.bid_price_5,
+                        DbTickData.ask_price_1: DbTickData.ask_price_1,
+                        DbTickData.ask_price_2: DbTickData.ask_price_2,
+                        DbTickData.ask_price_3: DbTickData.ask_price_3,
+                        DbTickData.ask_price_4: DbTickData.ask_price_4,
+                        DbTickData.ask_price_5: DbTickData.ask_price_5,
+                        DbTickData.bid_volume_1: DbTickData.bid_volume_1,
+                        DbTickData.bid_volume_2: DbTickData.bid_volume_2,
+                        DbTickData.bid_volume_3: DbTickData.bid_volume_3,
+                        DbTickData.bid_volume_4: DbTickData.bid_volume_4,
+                        DbTickData.bid_volume_5: DbTickData.bid_volume_5,
+                        DbTickData.ask_volume_1: DbTickData.ask_volume_1,
+                        DbTickData.ask_volume_2: DbTickData.ask_volume_2,
+                        DbTickData.ask_volume_3: DbTickData.ask_volume_3,
+                        DbTickData.ask_volume_4: DbTickData.ask_volume_4,
+                        DbTickData.ask_volume_5: DbTickData.ask_volume_5,
+                        DbTickData.localtime: DbTickData.localtime,
+                    },
+                    conflict_target=(
+                        DbTickData.symbol,
+                        DbTickData.exchange,
+                        DbTickData.datetime,
+                    ),
+                ).execute()
+
+        # 更新Tick汇总数据
+        overview: DbTickOverview = DbTickOverview.get_or_none(
+            DbTickOverview.symbol == symbol,
+            DbTickOverview.exchange == exchange.value,
+        )
+
+        if not overview:
+            overview: DbTickOverview = DbTickOverview()
+            overview.symbol = symbol
+            overview.exchange = exchange.value
+            overview.start = ticks[0].datetime
+            overview.end = ticks[-1].datetime
+            overview.count = len(ticks)
+        elif stream:
+            overview.end = ticks[-1].datetime
+            overview.count += len(ticks)
+        else:
+            overview.start = min(ticks[0].datetime, overview.start)
+            overview.end = max(ticks[-1].datetime, overview.end)
+
+            s: ModelSelect = DbTickData.select().where(
+                (DbTickData.symbol == symbol)
+                & (DbTickData.exchange == exchange.value)
+            )
+            overview.count = s.count()
+
+        overview.save()
 
         return True
 
@@ -250,7 +359,7 @@ class PostgresqlDatabase(BaseDatabase):
 
         bars: List[BarData] = []
         for db_bar in s:
-            bar = BarData(
+            bar: BarData = BarData(
                 symbol=db_bar.symbol,
                 exchange=Exchange(db_bar.exchange),
                 datetime=datetime.fromtimestamp(db_bar.datetime.timestamp(), DB_TZ),
@@ -287,7 +396,7 @@ class PostgresqlDatabase(BaseDatabase):
 
         ticks: List[TickData] = []
         for db_tick in s:
-            tick = TickData(
+            tick: TickData = TickData(
                 symbol=db_tick.symbol,
                 exchange=Exchange(db_tick.exchange),
                 datetime=datetime.fromtimestamp(db_tick.datetime.timestamp(), DB_TZ),
@@ -342,7 +451,7 @@ class PostgresqlDatabase(BaseDatabase):
             & (DbBarData.exchange == exchange.value)
             & (DbBarData.interval == interval.value)
         )
-        count = d.execute()
+        count: int = d.execute()
 
         # 删除K线汇总数据
         d2: ModelDelete = DbBarOverview.delete().where(
@@ -363,22 +472,39 @@ class PostgresqlDatabase(BaseDatabase):
             (DbTickData.symbol == symbol)
             & (DbTickData.exchange == exchange.value)
         )
-        count = d.execute()
+        count: int = d.execute()
+
+        # 删除Tick汇总数据
+        d2: ModelDelete = DbTickOverview.delete().where(
+            (DbTickOverview.symbol == symbol)
+            & (DbTickOverview.exchange == exchange.value)
+        )
+        d2.execute()
+
         return count
 
     def get_bar_overview(self) -> List[BarOverview]:
         """查询数据库中的K线汇总信息"""
         # 如果已有K线，但缺失汇总信息，则执行初始化
-        data_count = DbBarData.select().count()
-        overview_count = DbBarOverview.select().count()
+        data_count: int = DbBarData.select().count()
+        overview_count: int = DbBarOverview.select().count()
         if data_count and not overview_count:
             self.init_bar_overview()
 
         s: ModelSelect = DbBarOverview.select()
-        overviews = []
+        overviews: List[BarOverview] = []
         for overview in s:
             overview.exchange = Exchange(overview.exchange)
             overview.interval = Interval(overview.interval)
+            overviews.append(overview)
+        return overviews
+
+    def get_tick_overview(self) -> List[TickOverview]:
+        """查询数据库中的Tick汇总信息"""
+        s: ModelSelect = DbTickOverview.select()
+        overviews: list = []
+        for overview in s:
+            overview.exchange = Exchange(overview.exchange)
             overviews.append(overview)
         return overviews
 
@@ -398,7 +524,7 @@ class PostgresqlDatabase(BaseDatabase):
         )
 
         for data in s:
-            overview = DbBarOverview()
+            overview: DbBarOverview = DbBarOverview()
             overview.symbol = data.symbol
             overview.exchange = data.exchange
             overview.interval = data.interval
